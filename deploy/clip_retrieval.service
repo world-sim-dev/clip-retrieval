@@ -1,0 +1,17 @@
+[Unit]
+Description=Clip Retrieval Service
+After=network.target
+
+[Service]
+User=root
+Group=root
+WorkingDirectory=/mnt/data-pipeline/work/clip-retrieval
+Environment="PATH=/path/to/venv/bin"
+ExecStart=gunicorn --bind 0.0.0.0:8000 web_dynamic.2-hbnb:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=5
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

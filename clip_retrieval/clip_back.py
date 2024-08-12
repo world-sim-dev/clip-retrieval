@@ -211,39 +211,22 @@ class KnnService(Resource):
         image_input,
         image_url_input,
         embedding_input,
-        use_mclip,
         aesthetic_score,
         aesthetic_weight,
     ):
         """compute the query embedding"""
-        import torch  # pylint: disable=import-outside-toplevel
 
         if text_input is not None and text_input != "":
-            if use_mclip:
-                with TEXT_CLIP_INFERENCE_TIME.time():
-                    query = normalized(clip_resource.model_txt_mclip(text_input))
-            else:
-                with TEXT_PREPRO_TIME.time():
-                    text = clip_resource.tokenizer([text_input]).to(clip_resource.device)
-                with TEXT_CLIP_INFERENCE_TIME.time():
-                    with torch.no_grad():
-                        text_features = clip_resource.model.encode_text(text)
-                    text_features /= text_features.norm(dim=-1, keepdim=True)
-                    query = text_features.cpu().to(torch.float32).detach().numpy()
+            query = normalized(clip_resource.get_text_feature(text_input))
         elif image_input is not None or image_url_input is not None:
             if image_input is not None:
                 binary_data = base64.b64decode(image_input)
                 img_data = BytesIO(binary_data)
             elif image_url_input is not None:
                 img_data = download_image(image_url_input)
-            with IMAGE_PREPRO_TIME.time():
                 img = Image.open(img_data)
-                prepro = clip_resource.preprocess(img).unsqueeze(0).to(clip_resource.device)
-            with IMAGE_CLIP_INFERENCE_TIME.time():
-                with torch.no_grad():
-                    image_features = clip_resource.model.encode_image(prepro)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
-                query = image_features.cpu().to(torch.float32).detach().numpy()
+                query = normalized(clip_resource.get_image_feature(img))
+
         elif embedding_input is not None:
             query = np.expand_dims(np.array(embedding_input).astype("float32"), 0)
 
@@ -448,7 +431,6 @@ class KnnService(Resource):
             image_input=image_input,
             image_url_input=image_url_input,
             embedding_input=embedding_input,
-            use_mclip=use_mclip,
             aesthetic_score=aesthetic_score,
             aesthetic_weight=aesthetic_weight,
         )
@@ -477,7 +459,7 @@ class KnnService(Resource):
         image_input = json_data.get("image", None)
         image_url_input = json_data.get("image_url", None)
         embedding_input = json_data.get("embedding_input", None)
-        modality = json_data["modality"]
+        modality = json_data.get("modality", "image")
         num_images = json_data["num_images"]
         num_result_ids = json_data.get("num_result_ids", num_images)
         indice_name = json_data["indice_name"]
@@ -771,10 +753,8 @@ class ClipResource:
     """the resource for clip : model, index, options"""
 
     device: str
-    model: Any
-    preprocess: Callable
-    tokenizer: Callable
-    model_txt_mclip: Any
+    get_text_feature: Callable
+    get_image_feature: Callable
     safety_model: Any
     violence_detector: Any
     metadata_provider: Any
@@ -858,19 +838,37 @@ def load_mclip(clip_model):
     model_txt_mclip = encode_texts
     return model_txt_mclip
 
+def load_clip():
+    from transformers import CLIPProcessor, CLIPModel, AutoTokenizer
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_path = "/mnt/data-pipeline/pretrained_models/clip-vit-large-patch14"
+    processor = CLIPProcessor.from_pretrained(model_path)
+    model = CLIPModel.from_pretrained(model_path)
+    model = model.to(device)
+    model.eval()
+
+    def encode_text(text):
+        with torch.no_grad():
+            text_inputs = processor(text=[text], return_tensors="pt", padding=True).to(device)
+            text_features = model.get_text_features(**text_inputs)
+            return text_features.cpu().detach().numpy()
+    
+    def encode_image(image):
+        pass
+
+    return encode_text, encode_image
+
 
 def load_clip_index(clip_options):
     """load the clip index"""
     import torch  # pylint: disable=import-outside-toplevel
-    from all_clip import load_clip  # pylint: disable=import-outside-toplevel
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, preprocess, tokenizer = load_clip(clip_options.clip_model, use_jit=clip_options.use_jit, device=device)
+    get_text_feature, get_image_feature = load_clip()
 
     if clip_options.enable_mclip_option:
-        model_txt_mclip = load_mclip(clip_options.clip_model)
-    else:
-        model_txt_mclip = None
+        get_text_feature = load_mclip(clip_options.clip_model)
 
     safety_model = load_safety_model(clip_options.clip_model) if clip_options.provide_safety_model else None
     violence_detector = (
@@ -908,10 +906,8 @@ def load_clip_index(clip_options):
 
     return ClipResource(
         device=device,
-        model=model,
-        preprocess=preprocess,
-        tokenizer=tokenizer,
-        model_txt_mclip=model_txt_mclip,
+        get_text_feature=get_text_feature,
+        get_image_feature=get_image_feature,
         safety_model=safety_model,
         violence_detector=violence_detector,
         metadata_provider=metadata_provider,
@@ -951,26 +947,24 @@ def load_clip_indices(
 
 # reorder_metadata_by_ivf_index allows faster data retrieval of knn results by re-ordering the metadata by the ivf clusters
 def clip_back(
-    indices_paths="indices_paths.json",
-    port=1234,
+    indices_paths="./configs/indices_paths.json",
     enable_hdf5=False,
     enable_faiss_memory_mapping=False,
     columns_to_return=None,
     reorder_metadata_by_ivf_index=False,
-    default_backend=None,
-    url_column="url",
-    enable_mclip_option=True,
+    enable_mclip_option=False,
     clip_model="ViT-B/32",
     use_jit=True,
     use_arrow=False,
     provide_safety_model=False,
     provide_violence_detector=False,
-    provide_aesthetic_embeddings=True,
+    provide_aesthetic_embeddings=False,
 ):
     """main entry point of clip back, start the endpoints"""
     print("starting boot of clip back")
     if columns_to_return is None:
-        columns_to_return = ["url", "image_path", "caption", "NSFW"]
+        columns_to_return = ["seq_num", "url", "image_path", "caption", "NSFW"]
+
     clip_resources = load_clip_indices(
         indices_paths=indices_paths,
         clip_options=ClipOptions(
@@ -992,9 +986,6 @@ def clip_back(
 
     app = Flask(__name__)
     app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/metrics": make_wsgi_app()})
-    from .clip_front import add_static_endpoints  # pylint: disable=import-outside-toplevel
-
-    add_static_endpoints(app, default_backend, None, url_column)
 
     api = Api(app)
     api.add_resource(MetricsSummary, "/metrics-summary")
@@ -1015,8 +1006,11 @@ def clip_back(
     )
     CORS(app)
     LOGGER.info("starting!")
+    return app
+
+def start_clip_back(port=1234):
+    app = clip_back()
     app.run(host="0.0.0.0", port=port, debug=False)
 
-
 if __name__ == "__main__":
-    fire.Fire(clip_back)
+    fire.Fire(start_clip_back)
